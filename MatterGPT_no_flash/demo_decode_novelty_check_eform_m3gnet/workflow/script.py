@@ -58,19 +58,30 @@ DB_PATH = '../structure_database.db'
 with open('temp_splited.csv', 'r') as f:
     reader = csv.reader(f)
     for row in reader:
+        if not row:
+            continue
+        # Use last column as SLICES to support prop + crystal_system + SLICES layouts
+        slices_str = row[-1].strip()
         try:
     
-            if CG.check_SLICES(row[1],strategy=4,dupli_check=False): 
-                structure,energy_per_atom=CG.SLICES2structure(row[1])
+            if CG.check_SLICES(slices_str,strategy=4,dupli_check=False): 
+                structure,energy_per_atom=CG.SLICES2structure(slices_str)
                 if not find_abnormal_lattices(structure):
                     gc.collect()
                     tf.keras.backend.clear_session() 
                     finder = SpacegroupAnalyzer(structure)
                     try:
-                        primitive_standard_structure = finder.get_primitive_standard_structure() 
+                        primitive_standard_structure = finder.get_primitive_standard_structure()
                     except Exception as e:
-                        print("Warning: get_primitive_standard_structure failed!!!",e) 
+                        print("Warning: get_primitive_standard_structure failed!!!", e)
                         primitive_standard_structure = structure
+                    try:
+                        spacegroup_number = SpacegroupAnalyzer(
+                            primitive_standard_structure
+                        ).get_space_group_number()
+                    except Exception as e:
+                        print("Warning: get_space_group_number failed!!!", e)
+                        spacegroup_number = ""
                     comp = primitive_standard_structure.composition
         
                     enthalpyForm=energy_per_atom*comp.num_atoms 
@@ -102,8 +113,8 @@ with open('temp_splited.csv', 'r') as f:
                         novelty=1 
            
                     with open("result2.csv",'a') as fn:
-                        fn.write(row[0]+','+row[1]+','+str(enthalpyForm_per_atom) \
-                        +',"'+primitive_standard_structure.to(fmt="poscar")+'",'+str(novelty)+'\n')
+                        fn.write(row[0]+','+slices_str+','+str(enthalpyForm_per_atom) \
+                        +','+str(spacegroup_number)+',"'+primitive_standard_structure.to(fmt="poscar")+'",'+str(novelty)+'\n')
         except Exception as e:
             del CG
             CG=SLICES(graph_method=graph_method, check_results=check, relax_model="m3gnet") 

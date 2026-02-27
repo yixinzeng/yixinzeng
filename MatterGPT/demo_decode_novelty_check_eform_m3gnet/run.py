@@ -166,7 +166,7 @@ def process_data(input_csv, output_csv, structure_json_path, threads):
         output=output_csv,
         glob_target="./job_*/result.csv",  
         cleanup=True,
-        header="eform_target,SLICES,eform_chgnet,poscar,novelty\n"
+        header="eform_target,SLICES,eform_chgnet,spacegroup_number,poscar,novelty\n"
     ) 
     print("Results collected into 'results.csv'.")
 
@@ -196,7 +196,7 @@ def prepare_data(results_file, training_file):
         trainingset_values = []
         print("Warning: Training file does not have formation energy column. Skipping training data in plot.") 
 
-    novelty_values = results_1.iloc[:, 4].tolist()
+    novelty_values = results_1.iloc[:, 5].tolist()
 
     data_dict = {}
     for header, value, novelty in zip(header_values, data_values, novelty_values):

@@ -1,9 +1,22 @@
 import os
+# Limit per-process native threads to avoid CPU oversubscription during DB multiprocessing.
+# You can override via MATTERGPT_NUMERIC_THREADS=<n>.
+_numeric_threads = os.environ.get("MATTERGPT_NUMERIC_THREADS", "1")
+os.environ["OMP_NUM_THREADS"] = _numeric_threads
+os.environ["OPENBLAS_NUM_THREADS"] = _numeric_threads
+os.environ["MKL_NUM_THREADS"] = _numeric_threads
+os.environ["NUMEXPR_NUM_THREADS"] = _numeric_threads
+os.environ["VECLIB_MAXIMUM_THREADS"] = _numeric_threads
+os.environ["BLIS_NUM_THREADS"] = _numeric_threads
+
 import csv
 import json
 import argparse
 import sqlite3
 import glob
+import hashlib
+import time
+import multiprocessing as mp
 from pymatgen.core.structure import Structure
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from slices.utils import splitRun_csv, show_progress, collect_csv
@@ -13,7 +26,85 @@ except ImportError:
     tqdm = None
 
 
-def build_structure_database(structure_json_path, db_path):
+def _compute_file_sha256(file_path, chunk_size=1024 * 1024):
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _build_source_fingerprint(structure_json_path):
+    return {
+        "source_json_sha256": _compute_file_sha256(structure_json_path),
+    }
+
+
+def _check_structure_database_freshness(db_path, structure_json_path):
+    """
+    Return (needs_rebuild, reason, source_fingerprint).
+    Freshness is defined by JSON content hash, not file path.
+    """
+    source_fingerprint = _build_source_fingerprint(structure_json_path)
+    if not os.path.exists(db_path):
+        return True, f"Database '{db_path}' not found.", source_fingerprint
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='structures'")
+        if not cursor.fetchone():
+            conn.close()
+            return True, "Missing table 'structures'.", source_fingerprint
+
+        cursor.execute("SELECT COUNT(*) FROM structures")
+        row_count = int(cursor.fetchone()[0])
+        if row_count == 0:
+            conn.close()
+            return True, "Table 'structures' is empty.", source_fingerprint
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='db_meta'")
+        if not cursor.fetchone():
+            conn.close()
+            return True, "Missing table 'db_meta' (old DB format).", source_fingerprint
+
+        cursor.execute("SELECT key, value FROM db_meta")
+        meta = {k: v for k, v in cursor.fetchall()}
+        conn.close()
+    except Exception as e:
+        return True, f"Failed to inspect DB: {e}", source_fingerprint
+
+    required_keys = ["source_json_sha256"]
+    missing_keys = [k for k in required_keys if k not in meta]
+    if missing_keys:
+        return True, f"Missing metadata keys: {missing_keys}", source_fingerprint
+
+    if str(meta.get("source_json_sha256", "")) != str(source_fingerprint.get("source_json_sha256", "")):
+        return True, "JSON content hash changed.", source_fingerprint
+
+    return False, "Database is up-to-date with novelty JSON.", source_fingerprint
+
+
+def _prepare_db_record(cif_entry):
+    cif_string = cif_entry.get("cif")
+    if not cif_string:
+        return None, "empty_cif"
+    try:
+        stru = Structure.from_str(cif_string, "cif")
+        finder = SpacegroupAnalyzer(stru)
+        primitive_stru = finder.get_primitive_standard_structure()
+        spacegroup = finder.get_space_group_number()
+        composition = primitive_stru.composition.reduced_formula
+        primitive_cif = primitive_stru.to(fmt="cif")
+        return (composition, spacegroup, primitive_cif), None
+    except Exception as e:
+        return None, str(e)
+
+
+def build_structure_database(structure_json_path, db_path, source_fingerprint=None, db_build_workers=1):
     """
     Build a SQLite structure database from a JSON file containing CIFs.
 
@@ -26,6 +117,14 @@ def build_structure_database(structure_json_path, db_path):
         "构建过程通常需要 40-50 分钟（取决于 CPU 性能和 I/O 速度），初次构建后新颖性检查无需二次重复构建。"
         "过程中会显示实时进度条，请耐心等待。"
     )
+
+    if os.path.exists(db_path):
+        try:
+            os.remove(db_path)
+            print(f"已删除旧数据库 '{db_path}'，准备全量重建。")
+        except OSError as e:
+            print(f"无法删除旧数据库 '{db_path}': {e}")
+            exit(1)
 
     try:
         conn = sqlite3.connect(db_path)
@@ -40,12 +139,15 @@ def build_structure_database(structure_json_path, db_path):
             )
             """
         )
-        if cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='structures'"
-        ).fetchone():
-            print("表 'structures' 已存在，将追加或覆盖数据。")
-        else:
-            print("已创建新表 'structures'。")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS db_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        print("已创建新表 'structures' 和 'db_meta'。")
     except sqlite3.Error as e:
         print(f"数据库连接或创建失败: {e}")
         exit(1)
@@ -69,49 +171,88 @@ def build_structure_database(structure_json_path, db_path):
 
     processed = 0
     failed = 0
+    insert_sql = "INSERT INTO structures (composition, spacegroup, primitive_cif) VALUES (?, ?, ?)"
+    pending_rows = []
+    batch_commit_size = 1000
+    db_build_workers = max(int(db_build_workers), 1)
 
     if tqdm is None:
         print("Error: tqdm not installed. Please install it to show progress, e.g., `pip install tqdm`.")
         exit(1)
 
-    with tqdm(
-        total=total,
-        desc="构建数据库",
-        unit="结构",
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-    ) as pbar:
-        for idx, cif_entry in enumerate(cifs, start=1):
-            cif_string = cif_entry.get("cif")
-            if not cif_string:
+    parallel_failed = False
+    if db_build_workers > 1:
+        print(f"使用并行构建：{db_build_workers} 个进程")
+        try:
+            with tqdm(
+                total=total,
+                desc="构建数据库",
+                unit="结构",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            ) as pbar:
+                with mp.Pool(processes=db_build_workers) as pool:
+                    for idx, (row, err_msg) in enumerate(
+                        pool.imap_unordered(_prepare_db_record, cifs, chunksize=32), start=1
+                    ):
+                        if row is not None:
+                            pending_rows.append(row)
+                            processed += 1
+                            if len(pending_rows) >= batch_commit_size:
+                                cursor.executemany(insert_sql, pending_rows)
+                                conn.commit()
+                                pending_rows.clear()
+                        elif err_msg != "empty_cif":
+                            failed += 1
+                            if failed <= 10 and err_msg:
+                                print(f"\n警告：第 {idx} 条结构处理失败（已跳过）：{err_msg}")
+                        pbar.update(1)
+        except Exception as e:
+            parallel_failed = True
+            print(f"并行构建不可用（{type(e).__name__}: {e}），自动回退单进程。")
+            cursor.execute("DELETE FROM structures")
+            conn.commit()
+            processed = 0
+            failed = 0
+            pending_rows = []
+
+    if db_build_workers <= 1 or parallel_failed:
+        with tqdm(
+            total=total,
+            desc="构建数据库",
+            unit="结构",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        ) as pbar:
+            for idx, cif_entry in enumerate(cifs, start=1):
+                row, err_msg = _prepare_db_record(cif_entry)
+                if row is not None:
+                    pending_rows.append(row)
+                    processed += 1
+                    if len(pending_rows) >= batch_commit_size:
+                        cursor.executemany(insert_sql, pending_rows)
+                        conn.commit()
+                        pending_rows.clear()
+                elif err_msg != "empty_cif":
+                    failed += 1
+                    if failed <= 10 and err_msg:
+                        print(f"\n警告：第 {idx} 条结构处理失败（已跳过）：{err_msg}")
                 pbar.update(1)
-                continue
-            try:
-                stru = Structure.from_str(cif_string, "cif")
-                finder = SpacegroupAnalyzer(stru)
-                primitive_stru = finder.get_primitive_standard_structure()
-                spacegroup = finder.get_space_group_number()
 
-                composition = primitive_stru.composition.reduced_formula
-                primitive_cif = primitive_stru.to(fmt="cif")
+    if pending_rows:
+        cursor.executemany(insert_sql, pending_rows)
+        conn.commit()
 
-                cursor.execute(
-                    "INSERT INTO structures (composition, spacegroup, primitive_cif) VALUES (?, ?, ?)",
-                    (composition, spacegroup, primitive_cif),
-                )
-                processed += 1
-            except Exception as e:
-                failed += 1
-                if failed <= 10:
-                    print(f"\n警告：第 {idx} 条结构处理失败（已跳过）：{e}")
-
-            pbar.update(1)
-
-            if idx % 1000 == 0:
-                conn.commit()
+    if source_fingerprint is None:
+        source_fingerprint = _build_source_fingerprint(structure_json_path)
+    source_fingerprint = dict(source_fingerprint)
+    source_fingerprint["db_built_at_epoch"] = str(int(time.time()))
+    cursor.execute("DELETE FROM db_meta")
+    for key, value in source_fingerprint.items():
+        cursor.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES (?, ?)", (str(key), str(value)))
 
     conn.commit()
     print("\n插入完成，正在创建索引以加速后续新颖性查询...")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_composition ON structures (composition)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_spacegroup ON structures (spacegroup)")
     conn.commit()
     conn.close()
 
@@ -123,11 +264,19 @@ def build_structure_database(structure_json_path, db_path):
     print("   → 已创建 composition 索引，后续新颖性检查将显著加速（>100x）")
 
 
-def ensure_structure_database(structure_json_path, db_path):
-    if os.path.exists(db_path):
-        print(f"Found existing database '{db_path}'.")
-        return
-    build_structure_database(structure_json_path, db_path)
+def ensure_structure_database(structure_json_path, db_path, threads):
+    needs_rebuild, reason, fingerprint = _check_structure_database_freshness(db_path, structure_json_path)
+    if needs_rebuild:
+        print(f"Need rebuild database: {reason}")
+        db_build_workers = min(max(1, int(threads)), max(1, os.cpu_count() or 1))
+        build_structure_database(
+            structure_json_path,
+            db_path,
+            source_fingerprint=fingerprint,
+            db_build_workers=db_build_workers,
+        )
+    else:
+        print(f"Reusing existing database '{db_path}'. {reason}")
 
 
 def _read_csv_header(csv_path):
@@ -245,7 +394,7 @@ def main():
         exit(1)
 
     db_path = "structure_database.db"
-    ensure_structure_database(args.structure_json_for_novelty_check, db_path)
+    ensure_structure_database(args.structure_json_for_novelty_check, db_path, args.threads)
 
     process_data(args.input_csv, args.output_csv, args.threads)
 
